@@ -23,8 +23,10 @@ import argparse
 import json
 import os
 import re
+import shlex
 import subprocess
 import sys
+import time
 from datetime import datetime
 from pathlib import Path
 
@@ -34,50 +36,63 @@ CMUX_SESSION_FILE = os.path.expanduser(
 CLAUDE_PROJECTS_DIR = os.path.expanduser("~/.claude/projects")
 SNAPSHOT_DIR = os.path.expanduser("~/.cmux-snapshots")
 
+WATCH_LABEL = "com.cmux-sessions.auto-snapshot"
+WATCH_PLIST = os.path.expanduser(f"~/Library/LaunchAgents/{WATCH_LABEL}.plist")
+WATCH_LOG = os.path.join(SNAPSHOT_DIR, "auto-watch.log")
+
 
 # ── Process discovery ────────────────────────────────────────
 
 
+_CLAUDE_BIN_RE = re.compile(r"(^|/)claude(\s|$)")
+
+
 def get_claude_processes():
-    """Get all running Claude processes with their session IDs and working directories."""
+    """Get all running Claude processes.
+
+    Returns a list of dicts: {pid, tty, session_id, cwd}.
+    session_id is None when --session-id/--resume is absent (fresh sessions).
+    cwd is resolved lazily — only callers that need it call get_process_cwd().
+    """
     try:
+        # -ww: don't truncate the command field. Default BSD ps truncates to
+        # terminal width, which loses argv past column ~80.
         result = subprocess.run(
-            ["ps", "-eo", "pid,command"],
+            ["ps", "-eww", "-o", "pid,tty,command"],
             capture_output=True, text=True, timeout=5
         )
     except Exception:
         return []
 
     processes = []
-    for line in result.stdout.splitlines():
-        if "claude" not in line.lower() or "grep" in line:
+    for line in result.stdout.splitlines()[1:]:
+        parts = line.strip().split(None, 2)
+        if len(parts) < 3:
+            continue
+        pid, tty, cmd = parts[0], parts[1], parts[2]
+
+        # Filter to the claude binary specifically. The literal substring
+        # "claude" is too loose — Claude's own system prompt embeds the word
+        # "grep" (and others), so prior heuristics misfired both ways.
+        if not _CLAUDE_BIN_RE.search(cmd):
+            continue
+        # Skip processes without a controlling TTY — those are shell snapshots,
+        # eval wrappers, the agent harness itself, etc.
+        if tty in ("?", "??"):
             continue
 
-        parts = line.strip().split(None, 1)
-        if len(parts) < 2:
-            continue
-
-        pid = parts[0]
-        cmd = parts[1]
-
-        # Extract session ID from --session-id or --resume flags
         session_id = None
         for flag in ("--session-id", "--resume"):
-            match = re.search(rf"{flag}\s+(\S+)", cmd)
-            if match:
-                session_id = match.group(1)
+            m = re.search(rf"{flag}\s+(\S+)", cmd)
+            if m:
+                session_id = m.group(1)
                 break
-
-        if not session_id:
-            continue
-
-        # Get working directory via lsof
-        cwd = get_process_cwd(pid)
 
         processes.append({
             "pid": int(pid),
+            "tty": tty,
             "session_id": session_id,
-            "cwd": cwd,
+            "cwd": None,  # lazy
         })
 
     return processes
@@ -122,6 +137,40 @@ def get_git_branch(directory):
 
 SHELL_NAMES = {"bash", "zsh", "fish", "login", "sshd", "sh"}
 NOISE_CMDS = {"sleep", "ps", "head", "tail", "read", "cat", "grep", "awk", "sed"}
+
+
+def _is_claude_title(title):
+    """Decide if a panel title is owned by a Claude session.
+
+    Claude rewrites its tab title to:
+      - "✳ <summary>" (U+2733 sparkle) when idle/ready
+      - "<braille spinner> <summary>" (U+2800-U+28FF) when working
+      - Or contains the literal "Claude" (e.g. "Claude Code")
+    """
+    if not title:
+        return False
+    if "Claude" in title:
+        return True
+    c = title[0]
+    if c == "✳":
+        return True
+    if 0x2800 <= ord(c) <= 0x28FF:
+        return True
+    return False
+
+
+def is_claude_panel(panel):
+    return _is_claude_title(panel.get("title", "") if panel else "")
+
+
+def _clean_panel_title(title):
+    """Strip leading Claude-status glyphs from a panel title for display."""
+    if not title:
+        return ""
+    s = title
+    while s and (s[0] == "✳" or 0x2800 <= ord(s[0]) <= 0x28FF):
+        s = s[1:].lstrip()
+    return s or title  # if we stripped everything, return original
 
 
 def get_terminal_commands():
@@ -376,17 +425,21 @@ def cmd_snapshot(args):
     claude_procs = get_claude_processes()
     terminal_cmds = get_terminal_commands()
 
-    # Build a lookup: cwd -> [claude sessions], consumed as matched
+    # Index by TTY (precise 1:1 with cmux panels via panel.ttyName) and by
+    # cwd (fallback when ttyName is missing/unmapped).
+    claude_by_tty = {p["tty"]: p for p in claude_procs if p.get("tty")}
     claude_by_cwd = {}
     for proc in claude_procs:
-        cwd = proc.get("cwd")
-        if cwd:
-            claude_by_cwd.setdefault(cwd, []).append(proc)
+        # Resolve cwd lazily — only needed for the fallback path.
+        if proc.get("cwd") is None:
+            proc["cwd"] = get_process_cwd(proc["pid"])
+        if proc.get("cwd"):
+            claude_by_cwd.setdefault(proc["cwd"], []).append(proc)
 
     ws_filter = getattr(args, "workspace", None)
 
     snapshot_data = {
-        "version": 2,
+        "version": 3,
         "timestamp": datetime.now().isoformat(),
         "windows": [],
     }
@@ -410,17 +463,37 @@ def cmd_snapshot(args):
             workspace = {
                 "index": ws_idx,
                 "title": title,
+                "color": ws.get("customColor", "") or "",
+                "description": ws.get("description", "") or "",
+                "gitBranch": ws.get("gitBranch", "") or "",
                 "cwd": cwd,
                 "isSelected": ws_idx == selected_idx,
                 "isPinned": ws.get("isPinned", False),
+                "focusedPanelId": ws.get("focusedPanelId") or "",
                 "layout": layout,
                 "panels": [],
             }
 
-            # Build panel lookup by ID for layout ordering
-            panels_by_id = {p.get("id"): p for p in ws.get("panels", [])}
+            # Iterate panels in layout (tab-display) order, falling back to raw
+            # panels order for any panel not referenced in the layout.
+            raw_panels = ws.get("panels", [])
+            by_id = {p.get("id"): p for p in raw_panels}
+            ordered_ids = collect_layout_pane_ids(layout)
+            seen = set()
+            iter_panels = []
+            for pid in ordered_ids:
+                p = by_id.get(pid)
+                if p is not None and pid not in seen:
+                    iter_panels.append(p)
+                    seen.add(pid)
+            for p in raw_panels:
+                pid = p.get("id")
+                if pid not in seen:
+                    iter_panels.append(p)
+                    if pid:
+                        seen.add(pid)
 
-            for panel in ws.get("panels", []):
+            for panel in iter_panels:
                 panel_id = panel.get("id", "")
                 panel_dir = panel.get("directory", cwd)
                 panel_title = panel.get("title", "")
@@ -428,28 +501,61 @@ def cmd_snapshot(args):
                 is_pinned = panel.get("isPinned", False)
                 terminal = panel.get("terminal", {})
                 terminal_cwd = terminal.get("workingDirectory", panel_dir)
+                tty_name = panel.get("ttyName") or ""
 
-                # Determine if this is a Claude panel
-                is_claude = "Claude" in panel_title or panel_title.startswith("\u2733")
+                # Detect Claude via running process on the panel's TTY first —
+                # this catches sessions whose tab was manually renamed and
+                # is more reliable than title-glyph heuristics.
+                proc = claude_by_tty.get(tty_name)
+                is_claude = proc is not None or _is_claude_title(panel_title)
+                detection = None
                 claude_session = None
 
-                if is_claude and terminal_cwd:
-                    # Try to match with a running Claude process (consume match)
-                    matches = claude_by_cwd.get(terminal_cwd, [])
-                    if matches:
-                        proc = matches.pop(0)
-                        claude_session = {
-                            "session_id": proc["session_id"],
-                            "pid": proc["pid"],
-                        }
-                        meta = get_claude_session_info(terminal_cwd, proc["session_id"])
+                if proc is not None:
+                    detection = "tty"
+                    sid = proc.get("session_id")
+                    if not sid and terminal_cwd:
+                        # Fresh session (no --resume in argv): resolve via
+                        # the .jsonl index in the panel's directory.
+                        latest = find_latest_claude_session(terminal_cwd)
+                        if latest:
+                            sid = latest.get("sessionId")
+                    claude_session = {
+                        "session_id": sid,
+                        "pid": proc["pid"],
+                    }
+                    if sid and terminal_cwd:
+                        meta = get_claude_session_info(terminal_cwd, sid)
                         if meta:
                             claude_session["summary"] = meta.get("summary", "")
                             claude_session["gitBranch"] = meta.get("gitBranch", "")
+                elif is_claude and terminal_cwd:
+                    # Title-glyph detection without a running TTY-matched proc.
+                    # Try cwd-based match (older heuristic), then fall back to
+                    # the filesystem index.
+                    matches = claude_by_cwd.get(terminal_cwd, [])
+                    if matches:
+                        proc2 = matches.pop(0)
+                        detection = "cwd"
+                        claude_session = {
+                            "session_id": proc2.get("session_id"),
+                            "pid": proc2["pid"],
+                        }
+                        sid = proc2.get("session_id")
+                        if not sid:
+                            latest = find_latest_claude_session(terminal_cwd)
+                            if latest:
+                                sid = latest.get("sessionId")
+                                claude_session["session_id"] = sid
+                        if sid:
+                            meta = get_claude_session_info(terminal_cwd, sid)
+                            if meta:
+                                claude_session["summary"] = meta.get("summary", "")
+                                claude_session["gitBranch"] = meta.get("gitBranch", "")
                     else:
-                        # No running process — find latest session from index
                         latest = find_latest_claude_session(terminal_cwd)
                         if latest:
+                            detection = "index"
                             claude_session = {
                                 "session_id": latest["sessionId"],
                                 "pid": None,
@@ -465,6 +571,12 @@ def cmd_snapshot(args):
                     if cmds:
                         last_command = cmds.pop(0)  # consume to avoid duplicates
 
+                # customTitle is set by cmux ONLY when the user explicitly
+                # renamed the tab. Process-derived titles (Claude OSC status,
+                # cwd-default "…/some/dir") leave it absent. We restore only
+                # this — anything else would stomp on Claude's live status.
+                custom_title = (panel.get("customTitle") or "").strip()
+
                 panel_data = {
                     "id": panel_id,
                     "title": panel_title,
@@ -473,7 +585,13 @@ def cmd_snapshot(args):
                     "isPinned": is_pinned,
                     "isClaude": is_claude,
                 }
+                if custom_title:
+                    panel_data["customTitle"] = custom_title
+                if tty_name:
+                    panel_data["ttyName"] = tty_name
                 if claude_session:
+                    if detection:
+                        claude_session["detectedVia"] = detection
                     panel_data["claudeSession"] = claude_session
                 if last_command:
                     panel_data["lastCommand"] = last_command
@@ -533,18 +651,19 @@ def cmd_snapshot(args):
     print(f"  Panels:           {total_panels}")
     print(f"  Claude panels:    {total_claude} ({claude_with_session} with session IDs)")
 
+    # Auto-prune after snapshotting (used by the launchd watcher to avoid
+    # unbounded snapshot accumulation).
+    auto_prune = getattr(args, "auto_prune", None)
+    if auto_prune is not None and auto_prune > 0:
+        prune_args = argparse.Namespace(keep=auto_prune)
+        cmd_prune(prune_args)
+
 
 def cmd_list(args):
     """List active Claude sessions across all cmux workspaces."""
     cmux_data = load_cmux_session()
     claude_procs = get_claude_processes()
-
-    # Build process lookup by cwd — consume matches to avoid duplicates
-    claude_by_cwd = {}
-    for proc in claude_procs:
-        cwd = proc.get("cwd")
-        if cwd:
-            claude_by_cwd.setdefault(cwd, []).append(proc)
+    claude_by_tty = {p["tty"]: p for p in claude_procs if p.get("tty")}
 
     rows = []
     for win in cmux_data.get("windows", []):
@@ -555,16 +674,21 @@ def cmd_list(args):
 
             all_panels = ws.get("panels", [])
             total_panels = len(all_panels)
-            claude_count = sum(
-                1 for p in all_panels
-                if "Claude" in p.get("title", "") or p.get("title", "").startswith("\u2733")
-            )
+            # Claude detection: title glyph OR Claude proc on the panel's TTY.
+            def _panel_is_claude(p):
+                if _is_claude_title(p.get("title", "")):
+                    return True
+                tty = p.get("ttyName") or ""
+                return tty in claude_by_tty
+            claude_count = sum(1 for p in all_panels if _panel_is_claude(p))
             non_claude_count = total_panels - claude_count
             panels_str = f"{total_panels} ({claude_count}C/{non_claude_count}T)"
 
             for panel in all_panels:
                 panel_title = panel.get("title", "")
-                is_claude = "Claude" in panel_title or panel_title.startswith("\u2733")
+                tty_name = panel.get("ttyName") or ""
+                proc = claude_by_tty.get(tty_name)
+                is_claude = proc is not None or _is_claude_title(panel_title)
                 if not is_claude:
                     continue
 
@@ -572,21 +696,24 @@ def cmd_list(args):
                     "workingDirectory", panel.get("directory", "")
                 )
 
-                # Consume matching process to avoid double-counting
                 session_id = "-"
                 status = "stopped"
-                matches = claude_by_cwd.get(panel_dir, [])
-                if matches:
-                    proc = matches.pop(0)
-                    sid = proc["session_id"]
-                    session_id = sid[:12] + "..." if len(sid) > 15 else sid
+                sid = None
+                if proc is not None:
                     status = "running"
+                    sid = proc.get("session_id")
+                    if not sid and panel_dir:
+                        latest = find_latest_claude_session(panel_dir)
+                        if latest:
+                            sid = latest.get("sessionId")
+                    if sid:
+                        session_id = sid[:12] + "..." if len(sid) > 15 else sid
 
                 short_dir = panel_dir.replace(os.path.expanduser("~"), "~")
                 if len(short_dir) > 45:
                     short_dir = "..." + short_dir[-42:]
 
-                clean_title = panel_title.replace("\u2733 ", "").replace("\u2733", "")
+                clean_title = _clean_panel_title(panel_title)
                 if len(clean_title) > 35:
                     clean_title = clean_title[:32] + "..."
 
@@ -594,9 +721,8 @@ def cmd_list(args):
                 branch = "-"
                 if panel_dir:
                     meta = None
-                    if matches:
-                        # Already consumed above, but we can look up metadata
-                        meta = get_claude_session_info(panel_dir, proc["session_id"]) if status == "running" else None
+                    if sid and status == "running":
+                        meta = get_claude_session_info(panel_dir, sid)
                     if meta and meta.get("gitBranch"):
                         branch = meta["gitBranch"]
                     else:
@@ -654,12 +780,7 @@ def cmd_show(args):
         cmux_data = load_cmux_session()
         claude_procs = get_claude_processes()
         terminal_cmds = get_terminal_commands()
-
-        claude_by_cwd = {}
-        for proc in claude_procs:
-            cwd = proc.get("cwd")
-            if cwd:
-                claude_by_cwd.setdefault(cwd, []).append(proc)
+        claude_by_tty = {p["tty"]: p for p in claude_procs if p.get("tty")}
 
         found = False
         for win in cmux_data.get("windows", []):
@@ -668,7 +789,7 @@ def cmd_show(args):
                 if args.workspace and args.workspace.lower() not in ws_title.lower():
                     continue
                 found = True
-                _show_live_workspace(ws, claude_by_cwd, terminal_cmds, home)
+                _show_live_workspace(ws, claude_by_tty, terminal_cmds, home)
 
         if not found:
             if args.workspace:
@@ -678,7 +799,7 @@ def cmd_show(args):
             sys.exit(1)
 
 
-def _show_live_workspace(ws, claude_by_cwd, terminal_cmds, home):
+def _show_live_workspace(ws, claude_by_tty, terminal_cmds, home):
     """Print detailed info for a live workspace."""
     ws_title = ws.get("customTitle") or ws.get("title") or os.path.basename(ws.get("currentDirectory", ""))
     ws_cwd = ws.get("currentDirectory", "")
@@ -691,33 +812,40 @@ def _show_live_workspace(ws, claude_by_cwd, terminal_cmds, home):
 
     for i, panel in enumerate(panels):
         panel_title = panel.get("title", "")
-        is_claude = "Claude" in panel_title or panel_title.startswith("\u2733")
+        tty_name = panel.get("ttyName") or ""
+        proc = claude_by_tty.get(tty_name)
+        is_claude = proc is not None or _is_claude_title(panel_title)
         terminal = panel.get("terminal", {})
         panel_cwd = terminal.get("workingDirectory", panel.get("directory", ""))
         short_cwd = panel_cwd.replace(home, "~")
 
         kind = "claude" if is_claude else "terminal"
-        clean_title = panel_title.replace("\u2733 ", "").replace("\u2733", "").strip()
+        clean_title = _clean_panel_title(panel_title).strip()
         if not clean_title:
             clean_title = "(untitled)"
 
         print(f"  Panel {i + 1}: [{kind}] {clean_title}")
         print(f"    cwd: {short_cwd}")
+        if tty_name:
+            print(f"    tty: {tty_name}")
 
         if is_claude:
-            # Try to match running process
-            matches = claude_by_cwd.get(panel_cwd, [])
-            if matches:
-                proc = matches.pop(0)
-                print(f"    session: {proc['session_id']}")
+            if proc is not None:
+                sid = proc.get("session_id")
+                if not sid and panel_cwd:
+                    latest = find_latest_claude_session(panel_cwd)
+                    if latest:
+                        sid = latest.get("sessionId")
+                print(f"    session: {sid or '(unknown)'}")
                 print(f"    pid: {proc['pid']}")
-                print(f"    status: running")
-                meta = get_claude_session_info(panel_cwd, proc["session_id"])
-                if meta:
-                    if meta.get("summary"):
-                        print(f"    summary: {meta['summary']}")
-                    if meta.get("gitBranch"):
-                        print(f"    branch: {meta['gitBranch']}")
+                print(f"    status: running (matched by tty)")
+                if sid:
+                    meta = get_claude_session_info(panel_cwd, sid)
+                    if meta:
+                        if meta.get("summary"):
+                            print(f"    summary: {meta['summary']}")
+                        if meta.get("gitBranch"):
+                            print(f"    branch: {meta['gitBranch']}")
             else:
                 latest = find_latest_claude_session(panel_cwd)
                 if latest:
@@ -754,7 +882,7 @@ def _show_snapshot_workspace(ws, snap_path, timestamp, home):
         panel_title = panel.get("title", "")
 
         kind = "claude" if is_claude else "terminal"
-        clean_title = panel_title.replace("\u2733 ", "").replace("\u2733", "").strip()
+        clean_title = _clean_panel_title(panel_title).strip()
         if not clean_title:
             clean_title = "(untitled)"
 
@@ -850,144 +978,12 @@ def cmd_restore(args):
                 continue
 
             total_workspaces += 1
-            panels = ws.get("panels", [])
-            layout = ws.get("layout", {})
-
-            # Determine split order from layout
-            split_ops = layout_to_splits(layout)
-
-            # Step 1: Create workspace — use a shell var to capture its ref
-            # so all subsequent commands target it, not the caller's workspace
-            first_panel = panels[0] if panels else None
-            first_cmd = _panel_command(first_panel, run_commands) if first_panel else None
-            first_dir = first_panel.get("directory", cwd) if first_panel else cwd
-
-            # Variable name unique per workspace to avoid collisions in multi-workspace restores
-            ws_var = f"WS_{total_workspaces}"
-
-            steps.append({
-                "type": "workspace",
-                "desc": f"Create workspace: {title}",
-                "cmd": f"cmux new-workspace --cwd '{cwd}'",
-                "title": title,
-                "ws_var": ws_var,
-            })
-
-            # Capture the initial surface so we can target sends explicitly
-            surf_counter = 0
-            surf_var = f"S{total_workspaces}_{surf_counter}"
-            steps.append({
-                "type": "capture_surface",
-                "desc": f"    Capture initial surface",
-                "ws_var": ws_var,
-                "surf_var": surf_var,
-            })
-
-            # Send command to the first pane — always cd to the panel's
-            # directory first since the workspace shell may inherit the
-            # caller's cwd rather than --cwd
-            if first_cmd:
-                if "&&" in first_cmd:
-                    full_cmd = first_cmd
-                elif first_cmd.startswith("cd "):
-                    full_cmd = f"cd '{_sh_escape(first_dir)}'"
-                else:
-                    full_cmd = f"cd '{_sh_escape(first_dir)}' && {first_cmd}"
-            else:
-                full_cmd = f"cd '{_sh_escape(first_dir)}'"
-
-            steps.append({
-                "type": "send",
-                "desc": f"    Launch: {full_cmd[:50]}",
-                "cmd_tpl": f"cmux send --workspace \"${ws_var}\" --surface \"${surf_var}\" '{_sh_escape(full_cmd)}'",
-                "enter": True,
-                "ws_var": ws_var,
-                "surf_var": surf_var,
-            })
-
-            if first_panel:
-                total_panels += 1
-                if first_panel.get("isClaude"):
-                    total_claude += 1
-
-            # Step 2: Rename workspace
-            steps.append({
-                "type": "rename",
-                "desc": f"  Rename to: {title}",
-                "cmd_tpl": f"cmux rename-workspace --workspace \"${ws_var}\" '{_sh_escape(title)}'",
-                "ws_var": ws_var,
-            })
-
-            # Step 3: Create splits for remaining panes
-            # Map panel IDs to panel data
-            panels_by_id = {p.get("id"): p for p in panels}
-
-            # Use split_ops to determine split directions; skip first (it's the initial pane)
-            for i, op in enumerate(split_ops):
-                if i == 0:
-                    continue  # first pane is the workspace default
-
-                direction = op.get("direction", "right")
-                if not direction:
-                    direction = "right"
-
-                # Find the panel data for this split
-                panel = None
-                for pid in op.get("panelIds", []):
-                    if pid in panels_by_id:
-                        panel = panels_by_id[pid]
-                        break
-
-                if not panel:
-                    # Fallback: use panels in order
-                    if i < len(panels):
-                        panel = panels[i]
-
-                if not panel:
-                    continue
-
-                panel_dir = panel.get("directory", cwd)
-                panel_cmd = _panel_command(panel, run_commands)
-
-                # Create the split, then capture the new surface ref
-                surf_counter += 1
-                surf_var = f"S{total_workspaces}_{surf_counter}"
-
-                steps.append({
-                    "type": "split",
-                    "desc": f"  Split {direction}: {panel.get('title', 'panel')[:40]}",
-                    "cmd_tpl": f"cmux new-split {direction} --workspace \"${ws_var}\"",
-                    "ws_var": ws_var,
-                })
-
-                steps.append({
-                    "type": "capture_surface",
-                    "desc": f"    Capture new surface",
-                    "ws_var": ws_var,
-                    "surf_var": surf_var,
-                })
-
-                # Send command to the new surface — always cd to panel dir
-                if panel_cmd and "&&" in panel_cmd:
-                    # Compound command (e.g. cd ... && npm run dev) — use as-is
-                    full_cmd = panel_cmd
-                elif panel_cmd and not panel_cmd.startswith("cd "):
-                    full_cmd = f"cd '{_sh_escape(panel_dir)}' && {panel_cmd}"
-                else:
-                    full_cmd = f"cd '{_sh_escape(panel_dir)}'"
-
-                steps.append({
-                    "type": "send",
-                    "desc": f"    Launch: {full_cmd[:50]}",
-                    "cmd_tpl": f"cmux send --workspace \"${ws_var}\" --surface \"${surf_var}\" '{_sh_escape(full_cmd)}'",
-                    "enter": True,
-                    "ws_var": ws_var,
-                    "surf_var": surf_var,
-                })
-
-                total_panels += 1
-                if panel.get("isClaude"):
-                    total_claude += 1
+            ws_steps, ws_panel_count, ws_claude_count = _build_workspace_steps(
+                ws, total_workspaces, run_commands, home
+            )
+            steps.extend(ws_steps)
+            total_panels += ws_panel_count
+            total_claude += ws_claude_count
 
     if ws_filter and not matched_any:
         print(f"Error: No workspace matching '{ws_filter}' found in snapshot.", file=sys.stderr)
@@ -1117,33 +1113,51 @@ def cmd_restore(args):
         )
 
 
-def _print_dry_run(steps):
-    """Print a dry-run preview of restore steps."""
-    print("Steps:")
-    print()
-    for s in steps:
-        step_type = s["type"]
-        if step_type == "capture_surface":
-            ws_var = s.get("ws_var", "")
-            surf_var = s.get("surf_var", "")
-            print(f"  [   capture] {surf_var}=$(cmux list-panels --workspace \"${ws_var}\" | grep -o 'surface:[0-9]*' | tail -1)")
-            print()
-            continue
-        cmd = s.get("cmd_tpl", s.get("cmd", ""))
-        print(f"  [{step_type:>10}] {s['desc']}")
-        if step_type == "workspace":
-            ws_var = s.get("ws_var", "WS")
-            print(f"             $ {s['cmd']}")
-            print(f"             $ {ws_var}=$(cmux list-workspaces | tail -1 | awk '{{print $1}}')")
-        else:
-            print(f"             $ {cmd}")
-        if s.get("enter"):
-            ws_var = s.get("ws_var", "")
-            surf_var = s.get("surf_var", "")
-            surf_part = f" --surface \"${surf_var}\"" if surf_var else ""
-            print(f"             $ cmux send-key --workspace \"${ws_var}\"{surf_part} Enter")
-        print()
-    print("(dry run — no changes made)")
+# ── Restore step engine ─────────────────────────────────────
+#
+# Each restore step is an argv list (`argv`) — never a shell string —
+# plus an optional `captures` list that names regex patterns to extract
+# refs (workspace:N, surface:N, pane:N) from the command's stdout.
+#
+# Tokens of the form `${VAR}` inside argv are placeholders. They are
+# resolved at execute time from previously-captured refs. Bash output
+# preserves them as `"$VAR"`; everything else is shlex.quote'd.
+
+_VAR_TOKEN_RE = re.compile(r"\$\{(\w+)\}")
+_BARE_VAR_RE = re.compile(r"^\$\{(\w+)\}$")
+
+
+def _resolve_argv(argv, env):
+    """Substitute ${VAR} references. Returns (resolved_argv, missing_vars).
+
+    A missing var is one that's referenced as ${X} but not in env. Callers
+    must treat any missing var as fatal — otherwise the ${X} literal gets
+    passed to cmux, which falls back to "current/focused" context and the
+    command lands on the caller's pane instead of the target workspace.
+    """
+    out = []
+    missing = []
+    for tok in argv:
+        def sub(m):
+            v = env.get(m.group(1))
+            if v is None:
+                missing.append(m.group(1))
+                return m.group(0)
+            return v
+        out.append(_VAR_TOKEN_RE.sub(sub, tok))
+    return out, missing
+
+
+def _bash_token(tok):
+    """Render one argv token for a bash script.
+
+    Bare ${VAR} tokens become "$VAR" (so cmux refs expand naturally).
+    Everything else is shlex.quote'd.
+    """
+    m = _BARE_VAR_RE.match(tok)
+    if m:
+        return f'"${m.group(1)}"'
+    return shlex.quote(tok)
 
 
 def _run_cmux(args, timeout=10):
@@ -1157,101 +1171,450 @@ def _run_cmux(args, timeout=10):
         return False, "", str(e)
 
 
-def _get_surface_refs(ws_ref):
-    """Get all surface refs for a workspace."""
-    ok, out, err = _run_cmux(["cmux", "list-panels", "--workspace", ws_ref])
-    if not ok or not out:
-        return []
-    refs = []
-    for line in out.strip().splitlines():
-        match = re.search(r'(surface:\d+)', line)
-        if match:
-            refs.append(match.group(1))
-    return refs
+def _sh_escape(s):
+    """Escape single quotes for shell single-quoted embedding."""
+    return s.replace("'", "'\\''")
+
+
+# ── Workspace step builder ──────────────────────────────────
+
+
+def _claude_launch_cmd(panel):
+    """Return the `claude ...` command for a Claude panel, or None."""
+    sess = panel.get("claudeSession") or {}
+    sid = sess.get("session_id")
+    if sid:
+        return f"claude --resume {shlex.quote(sid)}"
+    return "claude -c"
+
+
+def _panel_launch_text(panel, panel_dir, run_commands):
+    """Build the shell text to send to a panel's surface.
+
+    Always starts with `cd <dir>` (so the new terminal lands in the right
+    place even if cmux's --cwd was inherited). Appends the Claude resume
+    or saved command when applicable.
+    """
+    parts = []
+    if panel_dir:
+        parts.append(f"cd {shlex.quote(panel_dir)}")
+    if panel.get("isClaude"):
+        parts.append(_claude_launch_cmd(panel))
+    else:
+        last_cmd = (panel.get("lastCommand") or "").strip()
+        if run_commands and last_cmd:
+            parts.append(last_cmd)
+    return " && ".join(parts) if parts else ""
+
+
+def _build_workspace_steps(ws, ws_num, run_commands, home):
+    """Build restore steps for one workspace.
+
+    Returns (steps, panel_count, claude_count).
+    """
+    title = ws.get("title", "untitled")
+    cwd = ws.get("cwd", "")
+    color = (ws.get("color") or "").strip()
+    description = (ws.get("description") or "").strip()
+    panels = ws.get("panels", [])
+    layout = ws.get("layout", {}) or {}
+    focused_id = (ws.get("focusedPanelId") or "").strip()
+
+    panels_by_id = {p.get("id"): p for p in panels}
+    ws_var = f"WS{ws_num}"
+
+    steps = []
+
+    # 1. Create workspace.
+    new_argv = ["cmux", "new-workspace"]
+    if cwd:
+        new_argv += ["--cwd", cwd]
+    if title and title != "untitled":
+        new_argv += ["--name", title]
+    if description:
+        new_argv += ["--description", description]
+    steps.append({
+        "type": "new-workspace",
+        "desc": f"Create workspace: {title}",
+        "argv": new_argv,
+        "captures": [{"var": ws_var, "pattern": r"workspace:[0-9]+"}],
+    })
+
+    # 2. Apply color via workspace-action (new-workspace has no --color flag).
+    if color:
+        steps.append({
+            "type": "set-color",
+            "desc": f"  Set color: {color}",
+            "argv": ["cmux", "workspace-action",
+                     "--action", "set-color",
+                     "--workspace", f"${{{ws_var}}}",
+                     "--color", color],
+        })
+
+    # 3. Walk layout tree. At each leaf pane, emit one step per panelId.
+    surf_counter = [0]
+    selected_surface_var = [None]
+    panel_count = [0]
+    claude_count = [0]
+    first_pane_var = [None]  # remember the workspace's initial pane for orphans
+
+    def emit_panel(panel, surf_var, pane_var):
+        """Emit send + rename-tab steps for a single restored panel."""
+        panel_dir = (panel.get("directory") or cwd or "").strip()
+        launch = _panel_launch_text(panel, panel_dir, run_commands)
+        if launch:
+            steps.append({
+                "type": "send",
+                "desc": f"    Launch: {launch[:70]}",
+                "argv": ["cmux", "send",
+                         "--workspace", f"${{{ws_var}}}",
+                         "--surface", f"${{{surf_var}}}",
+                         launch],
+                "post_enter": True,
+                "ws_var": ws_var,
+                "surf_var": surf_var,
+            })
+
+        # Only restore the tab title if the user explicitly renamed it.
+        # cmux makes `tab-action rename` sticky — it overrides subsequent
+        # OSC title escapes from the process. Re-applying a process-
+        # derived title (e.g. Claude's "✳ Reading file") would freeze the
+        # tab on that stale status instead of letting Claude update it.
+        custom_title = (panel.get("customTitle") or "").strip()
+        if custom_title:
+            steps.append({
+                "type": "rename-tab",
+                "desc": f"    Rename tab: {custom_title[:60]}",
+                "argv": ["cmux", "rename-tab",
+                         "--workspace", f"${{{ws_var}}}",
+                         "--surface", f"${{{surf_var}}}",
+                         custom_title],
+            })
+
+        panel_count[0] += 1
+        if panel.get("isClaude"):
+            claude_count[0] += 1
+
+    def emit_pane(pane_node, is_first_pane, split_dir, parent_pane_var):
+        """Emit steps for one pane node. Returns this pane's pane_var."""
+        panel_ids = pane_node.get("panelIds") or []
+        pane_selected = (pane_node.get("selectedPanelId") or "").strip()
+
+        pane_var = f"P{ws_num}_{surf_counter[0]}"
+        pane_ref_known = False
+
+        for i, pid in enumerate(panel_ids):
+            panel = panels_by_id.get(pid)
+            if panel is None:
+                continue
+
+            surf_counter[0] += 1
+            surf_var = f"S{ws_num}_{surf_counter[0]}"
+
+            if i == 0 and is_first_pane:
+                steps.append({
+                    "type": "lookup-initial",
+                    "desc": f"  Initial tab: {(panel.get('title') or '')[:60]}",
+                    "ws_var": ws_var,
+                    "surf_var": surf_var,
+                    "pane_var": pane_var,
+                })
+                pane_ref_known = True
+                if first_pane_var[0] is None:
+                    first_pane_var[0] = pane_var
+            elif i == 0:
+                # First panel of a non-initial pane => split off the parent.
+                # Targeting --panel <parent> is essential for nested layouts;
+                # without it cmux uses its current/focused pane heuristic and
+                # deeper splits land in unpredictable places.
+                split_argv = ["cmux", "new-split", split_dir,
+                              "--workspace", f"${{{ws_var}}}"]
+                if parent_pane_var:
+                    split_argv += ["--panel", f"${{{parent_pane_var}}}"]
+                steps.append({
+                    "type": "new-split",
+                    "desc": f"  Split {split_dir}: {(panel.get('title') or '')[:50]}",
+                    "argv": split_argv,
+                    "captures": [
+                        {"var": surf_var, "pattern": r"surface:[0-9]+"},
+                        {"var": pane_var, "pattern": r"pane:[0-9]+"},
+                    ],
+                })
+                pane_ref_known = True
+            else:
+                # Additional tab in the same pane.
+                # --focus true is essential: cmux inserts new surfaces after
+                # the currently focused one, so without it every new tab lands
+                # at position 1, reversing the intended order.
+                new_surf_argv = ["cmux", "new-surface",
+                                 "--workspace", f"${{{ws_var}}}",
+                                 "--focus", "true"]
+                if pane_ref_known:
+                    new_surf_argv += ["--pane", f"${{{pane_var}}}"]
+                steps.append({
+                    "type": "new-surface",
+                    "desc": f"  + Tab: {(panel.get('title') or '')[:60]}",
+                    "argv": new_surf_argv,
+                    "captures": [{"var": surf_var, "pattern": r"surface:[0-9]+"}],
+                })
+
+            emit_panel(panel, surf_var, pane_var)
+
+            # Remember which surface should be focused at the end.
+            if focused_id and pid == focused_id:
+                selected_surface_var[0] = surf_var
+            elif not focused_id and pane_selected and pid == pane_selected:
+                selected_surface_var[0] = surf_var
+
+        return pane_var if pane_ref_known else None
+
+    def walk(node, is_first_pane, split_dir, parent_pane_var):
+        """Walk the layout tree. Returns (still_first, last_leaf_pane_var).
+
+        Returning the *last* leaf (not the first) means each sibling split
+        attaches to the most-recently-created pane in the subtree above it.
+        This is the closest approximation of the original topology that
+        cmux's per-pane new-split CLI allows — cmux can't split a multi-
+        pane region as a unit, so arbitrary nested trees can't be perfectly
+        reconstructed.
+        """
+        ntype = node.get("type")
+        if ntype == "pane":
+            pv = emit_pane(node, is_first_pane, split_dir, parent_pane_var)
+            return False, pv
+        if ntype == "split":
+            orientation = node.get("orientation", "vertical")
+            direction = "right" if orientation == "vertical" else "down"
+            _, first_leaf = walk(
+                node.get("first", {}) or {}, is_first_pane, None, parent_pane_var)
+            _, second_leaf = walk(
+                node.get("second", {}) or {}, False, direction, first_leaf)
+            return False, second_leaf
+        return is_first_pane, parent_pane_var
+
+    # If layout is empty/unknown, synthesize a single pane from all panels
+    # so we don't silently drop them.
+    if layout.get("type") not in ("pane", "split"):
+        all_ids = [p.get("id") for p in panels if p.get("id")]
+        layout = {
+            "type": "pane",
+            "panelIds": all_ids,
+            "selectedPanelId": focused_id or "",
+        }
+
+    walk(layout, True, None, None)
+
+    # Catch panels not referenced by the layout tree — append them as extra
+    # tabs in the initial pane. Otherwise they're silently dropped.
+    referenced = set()
+    def _collect_referenced(node):
+        ntype = node.get("type")
+        if ntype == "pane":
+            for pid in (node.get("panelIds") or []):
+                if pid:
+                    referenced.add(pid)
+        elif ntype == "split":
+            _collect_referenced(node.get("first") or {})
+            _collect_referenced(node.get("second") or {})
+    _collect_referenced(layout)
+
+    orphans = [p for p in panels if p.get("id") and p["id"] not in referenced]
+    for panel in orphans:
+        surf_counter[0] += 1
+        surf_var = f"S{ws_num}_{surf_counter[0]}"
+        new_surf_argv = ["cmux", "new-surface",
+                         "--workspace", f"${{{ws_var}}}",
+                         "--focus", "true"]
+        if first_pane_var[0]:
+            new_surf_argv += ["--pane", f"${{{first_pane_var[0]}}}"]
+        steps.append({
+            "type": "new-surface",
+            "desc": f"  + Orphan tab: {(panel.get('title') or '')[:50]}",
+            "argv": new_surf_argv,
+            "captures": [{"var": surf_var, "pattern": r"surface:[0-9]+"}],
+        })
+        emit_panel(panel, surf_var, first_pane_var[0])
+        if focused_id and panel.get("id") == focused_id:
+            selected_surface_var[0] = surf_var
+
+    # 4. Focus the originally-focused tab.
+    if selected_surface_var[0]:
+        steps.append({
+            "type": "focus-panel",
+            "desc": f"  Focus selected tab",
+            "argv": ["cmux", "focus-panel",
+                     "--workspace", f"${{{ws_var}}}",
+                     "--panel", f"${{{selected_surface_var[0]}}}"],
+        })
+
+    return steps, panel_count[0], claude_count[0]
+
+
+# ── Restore step rendering ──────────────────────────────────
+
+
+def _step_argv_for_display(s):
+    """Return the argv tokens for a step, or None if it has no argv."""
+    return s.get("argv")
+
+
+def _format_bash_command(argv):
+    """Join argv into a bash-safe command string."""
+    return " ".join(_bash_token(t) for t in argv)
+
+
+def _print_dry_run(steps):
+    """Print a dry-run preview of restore steps."""
+    print("Steps:")
+    print()
+    for s in steps:
+        step_type = s["type"]
+        print(f"  [{step_type:>18}] {s['desc']}")
+
+        if step_type == "lookup-initial":
+            ws_var = s["ws_var"]
+            surf_var = s["surf_var"]
+            pane_var = s["pane_var"]
+            print(f"             $ {surf_var}=$(cmux list-pane-surfaces --workspace \"${ws_var}\" "
+                  f"| grep -oE 'surface:[0-9]+' | head -1)")
+            print(f"             $ {pane_var}=$(cmux list-panes --workspace \"${ws_var}\" "
+                  f"| grep -oE 'pane:[0-9]+' | head -1)")
+            print()
+            continue
+
+        argv = _step_argv_for_display(s)
+        captures = s.get("captures", [])
+        if argv:
+            cmd_str = _format_bash_command(argv)
+            if captures:
+                # Show first capture as `VAR=$(... | grep ...)`
+                first = captures[0]
+                grep_pattern = first["pattern"]
+                print(f"             $ {first['var']}=$({cmd_str} | grep -oE '{grep_pattern}' | head -1)")
+                for cap in captures[1:]:
+                    pat = cap["pattern"]
+                    print(f"             $ {cap['var']}=$(cmux {'list-panes' if 'pane' in pat else 'list-pane-surfaces'} "
+                          f"--workspace \"${s.get('ws_var', '')}\" | grep -oE '{pat}' | head -1)")
+            else:
+                print(f"             $ {cmd_str}")
+
+        if s.get("post_enter"):
+            ws_var = s.get("ws_var", "")
+            surf_var = s.get("surf_var", "")
+            print(f"             $ cmux send-key --workspace \"${ws_var}\" --surface \"${surf_var}\" Enter")
+        print()
+    print("(dry run — no changes made)")
+
+
+def _execute_step(s, env):
+    """Run one step against the live cmux socket. Mutates env with captured refs.
+
+    Returns True on success, None on hard failure (caller must exit).
+
+    Anything that would leave a downstream step running without a resolved
+    workspace/surface/pane ref is treated as fatal — otherwise the command
+    silently falls back to cmux's current/focused context and the restore
+    lands on the caller's pane.
+    """
+    step_type = s["type"]
+    ws_var = s.get("ws_var", "")
+    surf_var = s.get("surf_var", "")
+
+    if step_type == "lookup-initial":
+        ws_ref = env.get(s["ws_var"], "")
+        if not ws_ref:
+            print(f"    ERROR: no workspace ref for {s['ws_var']} — refusing to continue")
+            return None
+        surfaces = _list_pane_surfaces(ws_ref)
+        if not surfaces:
+            print(f"    ERROR: no surfaces found in {ws_ref}")
+            return None
+        env[s["surf_var"]] = surfaces[0]["ref"]
+        ok, out, _ = _run_cmux(["cmux", "list-panes", "--workspace", ws_ref])
+        pane_m = re.search(r"pane:[0-9]+", out or "") if ok else None
+        if not pane_m:
+            print(f"    ERROR: could not resolve initial pane ref in {ws_ref}")
+            return None
+        env[s["pane_var"]] = pane_m.group(0)
+        print(f"             surface={env[s['surf_var']]} pane={env[s['pane_var']]}")
+        return True
+
+    argv = s.get("argv")
+    if not argv:
+        return True
+
+    resolved, missing = _resolve_argv(argv, env)
+    if missing:
+        print(f"    ERROR: unresolved refs {sorted(set(missing))} — refusing to run with caller's cmux context")
+        return None
+
+    ok, out, err = _run_cmux(resolved)
+    if not ok:
+        # Steps that produce a ref later commands depend on are fatal.
+        # Side-effect-only steps (set-color, rename-tab, focus-panel,
+        # send) just warn — losing those degrades the restore but does
+        # not redirect future commands to the wrong workspace.
+        side_effect_only = {"set-color", "set-desc", "rename-tab",
+                            "focus-panel", "send"}
+        if step_type in side_effect_only:
+            print(f"    WARNING: {err or '(failed)'}")
+            return True
+        print(f"    ERROR: {err or '(failed)'}")
+        return None
+
+    # Capture refs from stdout. A capture miss is fatal — downstream
+    # placeholders for this var would silently expand to the current pane.
+    for cap in s.get("captures", []):
+        m = re.search(cap["pattern"], out or "")
+        if not m:
+            print(f"    ERROR: could not capture {cap['var']} (pattern {cap['pattern']}) "
+                  f"from output: {out!r}")
+            return None
+        env[cap["var"]] = m.group(0)
+        print(f"             {cap['var']}={m.group(0)}")
+
+    # Optional Enter after send. Both workspace and surface refs must be
+    # known — otherwise send-key would land on the caller's pane.
+    if s.get("post_enter"):
+        ws_ref = env.get(ws_var) if ws_var else None
+        surf_ref = env.get(surf_var) if surf_var else None
+        if not ws_ref or not surf_ref:
+            print(f"    ERROR: post_enter missing ws/surf refs (ws={ws_ref!r}, surf={surf_ref!r})")
+            return None
+        _run_cmux(["cmux", "send-key", "--workspace", ws_ref,
+                   "--surface", surf_ref, "Enter"])
+
+    return True
 
 
 def _execute_restore(steps, total_workspaces, total_panels, total_claude, non_claude):
     """Execute restore steps directly via cmux CLI."""
-    import time
-
-    ws_refs = {}   # ws_var -> resolved workspace ref
-    surf_refs = {} # surf_var -> resolved surface ref
-    known_surfaces = set()  # track surfaces we've already seen
+    env = {}  # var name -> resolved cmux ref
 
     for s in steps:
         step_type = s["type"]
-        ws_var = s.get("ws_var", "")
-        surf_var = s.get("surf_var", "")
-
-        if step_type == "capture_surface":
-            # Don't print a line for this internal step
-            ws_ref = ws_refs.get(ws_var, "")
-            if ws_ref:
-                current = _get_surface_refs(ws_ref)
-                # Find new surfaces we haven't seen before
-                new_refs = [r for r in current if r not in known_surfaces]
-                if new_refs:
-                    ref = new_refs[-1]  # newest
-                else:
-                    ref = current[-1] if current else ""  # fallback to last
-                if ref:
-                    surf_refs[surf_var] = ref
-                    known_surfaces.add(ref)
-                    print(f"             surface: {ref}")
-                else:
-                    print(f"    WARNING: No surface refs found")
-            continue
-
-        print(f"  [{step_type:>10}] {s['desc']}")
-
-        if step_type == "workspace":
-            ok, out, err = _run_cmux(s["cmd"].split())
-            if not ok:
-                print(f"    ERROR: {err}")
-                sys.exit(1)
-            time.sleep(1)
-
-            # Capture the new workspace ref
-            ok, out, err = _run_cmux(["cmux", "list-workspaces"])
-            if ok and out:
-                last_line = out.strip().splitlines()[-1]
-                ref = last_line.split()[0] if last_line else ""
-                ws_refs[ws_var] = ref
-                print(f"             ref: {ref}")
-            else:
-                print(f"    WARNING: Could not capture workspace ref: {err}")
-
+        if step_type != "lookup-initial":
+            print(f"  [{step_type:>18}] {s['desc']}")
         else:
-            # Resolve variable references in the command
-            cmd_str = s.get("cmd_tpl", s.get("cmd", ""))
-            if ws_var and ws_var in ws_refs:
-                cmd_str = cmd_str.replace(f'"${ws_var}"', ws_refs[ws_var])
-            if surf_var and surf_var in surf_refs:
-                cmd_str = cmd_str.replace(f'"${surf_var}"', surf_refs[surf_var])
+            print(f"  [{step_type:>18}] {s['desc']}")
 
-            ok, out, err = _run_cmux(["bash", "-c", cmd_str])
-            if not ok:
-                print(f"    WARNING: {err}")
+        rv = _execute_step(s, env)
+        if rv is None:
+            sys.exit(1)
 
-            if s.get("enter"):
-                ws_ref = ws_refs.get(ws_var, "")
-                surf_ref = surf_refs.get(surf_var, "")
-                send_key_args = ["cmux", "send-key"]
-                if ws_ref:
-                    send_key_args += ["--workspace", ws_ref]
-                if surf_ref:
-                    send_key_args += ["--surface", surf_ref]
-                send_key_args.append("Enter")
-                _run_cmux(send_key_args)
-
-            # Pacing
-            if step_type == "split":
-                time.sleep(0.3)
-            elif step_type == "send":
-                time.sleep(0.5)
+        # Pacing.
+        if step_type == "new-workspace":
+            time.sleep(0.6)
+        elif step_type == "new-split":
+            time.sleep(0.3)
+        elif step_type == "new-surface":
+            time.sleep(0.25)
+        elif step_type == "send":
+            time.sleep(0.3)
 
     print()
-    print(f"Restored {total_workspaces} workspaces, {total_panels} panels ({total_claude} Claude, {non_claude} terminal).")
+    print(f"Restored {total_workspaces} workspaces, {total_panels} panels "
+          f"({total_claude} Claude, {non_claude} terminal).")
 
 
 def _generate_restore_script(steps, snap_path, total_workspaces, total_panels, total_claude, non_claude):
@@ -1259,10 +1622,11 @@ def _generate_restore_script(steps, snap_path, total_workspaces, total_panels, t
     script_path = os.path.join(SNAPSHOT_DIR, "restore.sh")
     with open(script_path, "w") as f:
         f.write("#!/bin/bash\n")
-        f.write(f"# cmux workspace restore script\n")
+        f.write("# cmux workspace restore script\n")
         f.write(f"# Generated: {datetime.now().isoformat()}\n")
         f.write(f"# Source: {snap_path}\n")
-        f.write(f"# Workspaces: {total_workspaces}, Panels: {total_panels} ({total_claude} Claude, {non_claude} terminal)\n")
+        f.write(f"# Workspaces: {total_workspaces}, Panels: {total_panels} "
+                f"({total_claude} Claude, {non_claude} terminal)\n")
         f.write("#\n")
         f.write("# Run this from inside a cmux terminal.\n")
         f.write("# Review with --dry-run first: cmux-sessions restore --dry-run\n\n")
@@ -1270,80 +1634,59 @@ def _generate_restore_script(steps, snap_path, total_workspaces, total_panels, t
 
         for s in steps:
             step_type = s["type"]
+            f.write(f"# {s['desc']}\n")
 
-            if step_type == "capture_surface":
-                ws_var = s.get("ws_var", "")
-                surf_var = s.get("surf_var", "")
-                f.write(f"# Capture surface ref\n")
-                f.write(f"{surf_var}=$(cmux list-panels --workspace \"${ws_var}\" | grep -o 'surface:[0-9]*' | tail -1)\n")
+            if step_type == "lookup-initial":
+                ws_var = s["ws_var"]
+                surf_var = s["surf_var"]
+                pane_var = s["pane_var"]
+                f.write(f"{surf_var}=$(cmux list-pane-surfaces --workspace \"${ws_var}\" "
+                        f"| grep -oE 'surface:[0-9]+' | head -1)\n")
+                f.write(f"{pane_var}=$(cmux list-panes --workspace \"${ws_var}\" "
+                        f"| grep -oE 'pane:[0-9]+' | head -1)\n")
                 f.write("\n")
                 continue
 
-            cmd = s.get("cmd_tpl", s.get("cmd", ""))
-            f.write(f"# {s['desc']}\n")
+            argv = s.get("argv")
+            captures = s.get("captures", [])
+            if argv:
+                cmd_str = _format_bash_command(argv)
+                if captures:
+                    first = captures[0]
+                    f.write(f"_OUT=$({cmd_str})\n")
+                    f.write(f"echo \"$_OUT\"\n")
+                    for cap in captures:
+                        f.write(f"{cap['var']}=$(echo \"$_OUT\" | grep -oE '{cap['pattern']}' | head -1)\n")
+                else:
+                    f.write(f"{cmd_str}\n")
 
-            if step_type == "workspace":
-                ws_var = s.get("ws_var", "WS")
-                f.write(f"{s['cmd']}\n")
-                f.write("sleep 1\n")
-                f.write(f"{ws_var}=$(cmux list-workspaces | tail -1 | awk '{{print $1}}')\n")
-                f.write(f'echo "  Workspace ref: ${ws_var}"\n')
-            else:
-                f.write(f"{cmd}\n")
-
-            if s.get("enter"):
+            if s.get("post_enter"):
                 ws_var = s.get("ws_var", "")
                 surf_var = s.get("surf_var", "")
-                surf_part = f" --surface \"${surf_var}\"" if surf_var else ""
-                f.write(f"cmux send-key --workspace \"${ws_var}\"{surf_part} Enter\n")
+                f.write(f"cmux send-key --workspace \"${ws_var}\" --surface \"${surf_var}\" Enter\n")
 
-            if step_type == "split":
+            if step_type == "new-workspace":
+                f.write("sleep 0.6\n")
+            elif step_type == "new-split":
                 f.write("sleep 0.3\n")
+            elif step_type == "new-surface":
+                f.write("sleep 0.25\n")
             elif step_type == "send":
-                f.write("sleep 0.5\n")
+                f.write("sleep 0.3\n")
 
             f.write("\n")
 
-        f.write(f'echo "Restored {total_workspaces} workspaces, {total_panels} panels ({total_claude} Claude, {non_claude} terminal)."\n')
+        f.write(f'echo "Restored {total_workspaces} workspaces, {total_panels} panels '
+                f'({total_claude} Claude, {non_claude} terminal)."\n')
 
     os.chmod(script_path, 0o755)
 
-    print(f"Not running inside cmux — generated restore script instead.")
+    print("Not running inside cmux — generated restore script instead.")
     print()
     print(f"  {script_path}")
     print()
     print("Run it from inside a cmux terminal, or review first with:")
-    print(f"  cmux-sessions restore --dry-run")
-
-
-def _panel_command(panel, run_commands=False):
-    """Determine the shell command to launch in a panel."""
-    if not panel:
-        return None
-
-    if panel.get("isClaude"):
-        session = panel.get("claudeSession", {})
-        session_id = session.get("session_id")
-        if session_id:
-            return f"claude --resume {session_id}"
-        else:
-            return "claude -c"
-
-    # Non-Claude panels: cd to their working directory
-    panel_dir = panel.get("directory", "")
-    last_cmd = panel.get("lastCommand", "")
-
-    if run_commands and last_cmd and panel_dir:
-        return f"cd '{_sh_escape(panel_dir)}' && {last_cmd}"
-    elif panel_dir:
-        return f"cd '{_sh_escape(panel_dir)}'"
-
-    return None
-
-
-def _sh_escape(s):
-    """Escape single quotes for shell embedding."""
-    return s.replace("'", "'\\''")
+    print("  cmux-sessions restore --dry-run")
 
 
 def cmd_snapshots(args):
@@ -1610,8 +1953,23 @@ def _inside_cmux():
     return bool(os.environ.get("CMUX_WORKSPACE_ID"))
 
 
+# Matches lines like:
+#   "  workspace:1  Some Title"
+#   "* workspace:2  Other Title  [selected]"
+_WS_LINE_RE = re.compile(r"^\s*(\*\s+)?(workspace:\d+)\s+(.+?)(?:\s+\[selected\])?\s*$")
+
+# Matches lines like:
+#   "  surface:8  terminal  \"title\""
+#   "* surface:9  terminal  [focused]  \"title\""
+#   "  surface:8  some title with spaces"
+#   "* surface:9  some title  [selected]"
+_SURFACE_LINE_RE = re.compile(
+    r"^\s*(?P<sel>\*\s+)?(?P<ref>surface:\d+)\s+(?P<rest>.+?)\s*$"
+)
+
+
 def _get_live_workspaces():
-    """Query cmux for currently open workspaces. Returns list of dicts with id, title, index."""
+    """Query cmux for currently open workspaces. Returns list of dicts with ref, title, selected."""
     try:
         result = subprocess.run(
             ["cmux", "list-workspaces"],
@@ -1626,15 +1984,37 @@ def _get_live_workspaces():
         sys.exit(1)
 
     workspaces = []
-    for line in result.stdout.strip().splitlines():
-        # cmux list-workspaces outputs lines like: workspace:0  Title Here
-        parts = line.strip().split(None, 1)
-        if len(parts) < 2:
+    for line in result.stdout.splitlines():
+        m = _WS_LINE_RE.match(line)
+        if not m:
             continue
-        ref = parts[0]
-        title = parts[1]
-        workspaces.append({"ref": ref, "title": title})
+        workspaces.append({
+            "ref": m.group(2),
+            "title": m.group(3).strip(),
+            "selected": bool(m.group(1)) or "[selected]" in line,
+        })
     return workspaces
+
+
+def _list_pane_surfaces(ws_ref, pane_ref=None):
+    """List tabs (surfaces) in a workspace pane. Returns list of dicts: ref, title, selected."""
+    args = ["cmux", "list-pane-surfaces", "--workspace", ws_ref]
+    if pane_ref:
+        args += ["--pane", pane_ref]
+    ok, out, _ = _run_cmux(args)
+    if not ok or not out:
+        return []
+    result = []
+    for line in out.splitlines():
+        m = _SURFACE_LINE_RE.match(line)
+        if not m:
+            continue
+        rest = m.group("rest")
+        # Trim trailing "[selected]"
+        is_selected = bool(m.group("sel")) or "[selected]" in rest
+        title = re.sub(r"\s*\[selected\]\s*$", "", rest).strip()
+        result.append({"ref": m.group("ref"), "title": title, "selected": is_selected})
+    return result
 
 
 def _find_workspace_ref(ws_filter):
@@ -1688,7 +2068,7 @@ def cmd_kill(args):
                 panel_count = len(panels)
                 claude_count = sum(
                     1 for p in panels
-                    if "Claude" in p.get("title", "") or p.get("title", "").startswith("\u2733")
+                    if _is_claude_title(p.get("title", ""))
                 )
                 break
 
@@ -1747,7 +2127,7 @@ def cmd_respawn(args):
                 panel_count = len(panels)
                 claude_count = sum(
                     1 for p in panels
-                    if "Claude" in p.get("title", "") or p.get("title", "").startswith("\u2733")
+                    if _is_claude_title(p.get("title", ""))
                 )
                 break
 
@@ -1784,6 +2164,168 @@ def cmd_respawn(args):
     print(f"\n[3/3] Restoring '{title}'...")
     restore_args = argparse.Namespace(workspace=ws_filter, file=None, dry_run=False)
     cmd_restore(restore_args)
+
+
+# ── launchd auto-snapshot watcher ────────────────────────────
+
+
+def _launchctl(*args):
+    """Run launchctl; return (rc, stdout+stderr)."""
+    try:
+        r = subprocess.run(
+            ["launchctl", *args], capture_output=True, text=True, timeout=10
+        )
+        return r.returncode, (r.stdout + r.stderr).strip()
+    except Exception as e:
+        return 1, str(e)
+
+
+def _watch_plist_xml(script_path, python_bin, throttle, auto_prune):
+    """Build the LaunchAgent plist content."""
+    args_xml = "\n".join(
+        f"        <string>{x}</string>"
+        for x in [python_bin, script_path, "snapshot", "--auto-prune", str(auto_prune)]
+    )
+    return f"""<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>{WATCH_LABEL}</string>
+    <key>ProgramArguments</key>
+    <array>
+{args_xml}
+    </array>
+    <key>WatchPaths</key>
+    <array>
+        <string>{CMUX_SESSION_FILE}</string>
+    </array>
+    <key>ThrottleInterval</key>
+    <integer>{throttle}</integer>
+    <key>RunAtLoad</key>
+    <false/>
+    <key>StandardOutPath</key>
+    <string>{WATCH_LOG}</string>
+    <key>StandardErrorPath</key>
+    <string>{WATCH_LOG}</string>
+</dict>
+</plist>
+"""
+
+
+def cmd_install_watch(args):
+    """Install a launchd agent that snapshots on every cmux state file change."""
+    # Launchd agents can't read ~/Documents, ~/Desktop, or ~/Downloads under
+    # macOS TCC unless the user grants Full Disk Access. Sidestep by copying
+    # the script into SNAPSHOT_DIR (home root, no TCC restriction).
+    import shutil
+    source_path = os.path.realpath(__file__)
+    os.makedirs(SNAPSHOT_DIR, exist_ok=True)
+    script_path = os.path.join(SNAPSHOT_DIR, "cmux-sessions-watch.py")
+    shutil.copy2(source_path, script_path)
+    os.chmod(script_path, 0o755)
+    python_bin = sys.executable
+
+    if not os.path.exists(CMUX_SESSION_FILE):
+        print(f"Warning: cmux session file not found at {CMUX_SESSION_FILE}", file=sys.stderr)
+        print("        The agent will install but won't fire until cmux creates the file.", file=sys.stderr)
+
+    os.makedirs(os.path.dirname(WATCH_PLIST), exist_ok=True)
+
+    # If already installed, bootout first so the new plist takes effect.
+    uid = os.getuid()
+    if os.path.exists(WATCH_PLIST):
+        _launchctl("bootout", f"gui/{uid}", WATCH_PLIST)
+
+    plist_xml = _watch_plist_xml(script_path, python_bin, args.throttle, args.auto_prune)
+    with open(WATCH_PLIST, "w") as f:
+        f.write(plist_xml)
+
+    rc, out = _launchctl("bootstrap", f"gui/{uid}", WATCH_PLIST)
+    if rc != 0:
+        print(f"Error: launchctl bootstrap failed: {out}", file=sys.stderr)
+        sys.exit(1)
+
+    print(f"Installed: {WATCH_PLIST}")
+    print(f"  Label:         {WATCH_LABEL}")
+    print(f"  Script:        {script_path}  (copy of source — re-run install-watch after edits)")
+    print(f"  Throttle:      {args.throttle}s (max one snapshot per interval)")
+    print(f"  Auto-prune:    keep last {args.auto_prune} snapshots")
+    print(f"  Log:           {WATCH_LOG}")
+    print(f"  Watches:       {CMUX_SESSION_FILE}")
+    print()
+    print("The agent fires whenever cmux writes its session state. To test:")
+    print("  - Open or close a workspace in cmux.")
+    print(f"  - Within {args.throttle}s, a new snapshot should appear in {SNAPSHOT_DIR}.")
+    print("  - Run `cmux-sessions watch-status` to inspect.")
+
+
+def cmd_uninstall_watch(args):
+    """Remove the launchd auto-snapshot agent."""
+    if not os.path.exists(WATCH_PLIST):
+        print(f"Not installed: {WATCH_PLIST}")
+        return
+
+    uid = os.getuid()
+    rc, out = _launchctl("bootout", f"gui/{uid}", WATCH_PLIST)
+    # bootout returns nonzero if the agent isn't loaded; that's OK.
+    if rc != 0 and "Could not find" not in out and "No such process" not in out:
+        print(f"Warning: launchctl bootout: {out}", file=sys.stderr)
+
+    os.remove(WATCH_PLIST)
+    # Also remove the script copy (kept the source untouched).
+    script_copy = os.path.join(SNAPSHOT_DIR, "cmux-sessions-watch.py")
+    if os.path.exists(script_copy):
+        os.remove(script_copy)
+    print(f"Removed:   {WATCH_PLIST}")
+    print(f"Removed:   {script_copy}")
+    print(f"Log retained: {WATCH_LOG}")
+
+
+def cmd_watch_status(args):
+    """Show the auto-snapshot agent's state and recent activity."""
+    print(f"Plist:         {WATCH_PLIST}")
+    if not os.path.exists(WATCH_PLIST):
+        print("Status:        not installed")
+        print()
+        print("Install with:  cmux-sessions install-watch")
+        return
+
+    uid = os.getuid()
+    rc, out = _launchctl("print", f"gui/{uid}/{WATCH_LABEL}")
+    loaded = rc == 0
+    print(f"Status:        {'loaded' if loaded else 'plist exists but not loaded'}")
+
+    # Last few key lines from launchctl print
+    if loaded:
+        for line in out.splitlines():
+            ln = line.strip()
+            for k in ("state =", "last exit code =", "throttle interval =", "runs ="):
+                if ln.startswith(k):
+                    print(f"  {ln}")
+                    break
+
+    # Most recent snapshots
+    snaps = sorted(Path(SNAPSHOT_DIR).glob("cmux-*.json"),
+                   key=lambda p: p.stat().st_mtime, reverse=True)[:5]
+    if snaps:
+        print()
+        print("Recent snapshots:")
+        for p in snaps:
+            ts = datetime.fromtimestamp(p.stat().st_mtime).strftime("%Y-%m-%d %H:%M:%S")
+            print(f"  {ts}  {p.name}")
+
+    # Tail of the log
+    if os.path.exists(WATCH_LOG):
+        print()
+        print(f"Log tail ({WATCH_LOG}):")
+        try:
+            with open(WATCH_LOG) as f:
+                lines = f.readlines()
+            for line in lines[-10:]:
+                print(f"  {line.rstrip()}")
+        except Exception as e:
+            print(f"  (could not read: {e})")
 
 
 # ── Main ─────────────────────────────────────────────────────
@@ -1825,6 +2367,8 @@ examples:
     p_snap.add_argument("-o", "--output", help="Output file (default: ~/.cmux-snapshots/cmux-<timestamp>.json)")
     p_snap.add_argument("-w", "--workspace", help="Snapshot only this workspace (name substring or index)")
     p_snap.add_argument("-n", "--name", help="Give the snapshot a name (e.g. before-refactor)")
+    p_snap.add_argument("--auto-prune", type=int, default=None,
+                        help="After snapshotting, prune to keep last N (used by auto-watch)")
 
     # show
     p_show = sub.add_parser("show", help="Show detailed workspace info")
@@ -1865,6 +2409,20 @@ examples:
     p_respawn.add_argument("-w", "--workspace", required=True, help="Workspace to respawn (name substring)")
     p_respawn.add_argument("-y", "--yes", action="store_true", help="Skip confirmation prompt")
 
+    # install-watch
+    p_iw = sub.add_parser("install-watch",
+                          help="Install a launchd agent that auto-snapshots on cmux state changes")
+    p_iw.add_argument("--throttle", type=int, default=30,
+                      help="Min seconds between snapshots (default: 30)")
+    p_iw.add_argument("--auto-prune", type=int, default=50,
+                      help="Keep last N snapshots after each auto-snapshot (default: 50)")
+
+    # uninstall-watch
+    sub.add_parser("uninstall-watch", help="Remove the launchd auto-snapshot agent")
+
+    # watch-status
+    sub.add_parser("watch-status", help="Show auto-snapshot agent state and recent snapshots")
+
     args = parser.parse_args()
     commands = {
         "list": cmd_list,
@@ -1877,6 +2435,9 @@ examples:
         "restore": cmd_restore,
         "kill": cmd_kill,
         "respawn": cmd_respawn,
+        "install-watch": cmd_install_watch,
+        "uninstall-watch": cmd_uninstall_watch,
+        "watch-status": cmd_watch_status,
     }
     commands[args.command](args)
 
